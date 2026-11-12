@@ -141,6 +141,8 @@ type containerManagerImpl struct {
 	kubeClient clientset.Interface
 	// resourceUpdates is a channel that provides resource updates.
 	resourceUpdates chan resourceupdates.Update
+	// podConfigTracker tracks pods whose cgroups have been configured in memory.
+	podConfigTracker *podConfigTracker
 }
 
 type features struct {
@@ -295,6 +297,7 @@ func NewContainerManager(ctx context.Context, mountUtil mount.Interface, cadviso
 		cgroupRoot:          cgroupRoot,
 		recorder:            recorder,
 		qosContainerManager: qosContainerManager,
+		podConfigTracker:    newPodConfigTracker(),
 	}
 
 	cm.topologyManager, err = topologymanager.NewManager(
@@ -408,6 +411,7 @@ func (cm *containerManagerImpl) NewPodContainerManager() PodContainerManager {
 			podContainerManager:     cm,
 			memoryReservationPolicy: cm.MemoryReservationPolicy,
 			memoryThrottlingFactor:  cm.MemoryThrottlingFactor,
+			podConfigTracker:        cm.podConfigTracker,
 		}
 	}
 	return &podContainerManagerNoop{

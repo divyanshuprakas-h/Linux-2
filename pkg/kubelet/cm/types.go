@@ -118,6 +118,9 @@ type PodContainerManager interface {
 	// Exists returns true if the pod cgroup exists.
 	Exists(*v1.Pod) bool
 
+	// IsPodConfigured returns true if the pod's cgroup has been configured in memory.
+	IsPodConfigured(pod *v1.Pod) bool
+
 	// Destroy takes a pod Cgroup name as argument and destroys the pod's container.
 	Destroy(logger klog.Logger, name CgroupName) error
 

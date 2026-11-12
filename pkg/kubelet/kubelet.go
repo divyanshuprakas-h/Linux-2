@@ -2228,9 +2228,11 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 			}
 		}
 		if !podKilled || !runOnce {
-			if !pcm.Exists(pod) {
-				if err := kl.containerManager.UpdateQOSCgroups(logger); err != nil {
-					logger.V(2).Info("Failed to update QoS cgroups while syncing pod", "pod", klog.KObj(pod), "err", err)
+			if !pcm.IsPodConfigured(pod) {
+				if !pcm.Exists(pod) {
+					if err := kl.containerManager.UpdateQOSCgroups(logger); err != nil {
+						logger.V(2).Info("Failed to update QoS cgroups while syncing pod", "pod", klog.KObj(pod), "err", err)
+					}
 				}
 				if err := pcm.EnsureExists(logger, pod); err != nil {
 					kl.recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedToCreatePodContainer, "unable to ensure pod container exists: %v", err)

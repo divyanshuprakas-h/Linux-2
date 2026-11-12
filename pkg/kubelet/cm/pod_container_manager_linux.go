@@ -22,11 +22,13 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 
 	libcontainercgroups "github.com/opencontainers/cgroups"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
@@ -37,6 +39,45 @@ import (
 const (
 	podCgroupNamePrefix = "pod"
 )
+
+// podConfigTracker tracks pods whose cgroups have been configured in memory.
+type podConfigTracker struct {
+	sync.RWMutex
+	configuredPods sets.Set[types.UID]
+}
+
+func newPodConfigTracker() *podConfigTracker {
+	return &podConfigTracker{
+		configuredPods: sets.New[types.UID](),
+	}
+}
+
+func (t *podConfigTracker) isConfigured(uid types.UID) bool {
+	if t == nil {
+		return false
+	}
+	t.RLock()
+	defer t.RUnlock()
+	return t.configuredPods.Has(uid)
+}
+
+func (t *podConfigTracker) markConfigured(uid types.UID) {
+	if t == nil {
+		return
+	}
+	t.Lock()
+	defer t.Unlock()
+	t.configuredPods.Insert(uid)
+}
+
+func (t *podConfigTracker) unmark(uid types.UID) {
+	if t == nil {
+		return
+	}
+	t.Lock()
+	defer t.Unlock()
+	t.configuredPods.Delete(uid)
+}
 
 // podContainerManagerImpl implements podContainerManager interface.
 // It is the general implementation which allows pod level container
@@ -62,10 +103,24 @@ type podContainerManagerImpl struct {
 	memoryReservationPolicy kubeletconfig.MemoryReservationPolicy
 	// memoryThrottlingFactor is used to compute pod-level memory.high
 	memoryThrottlingFactor *float64
+	// podConfigTracker tracks pods whose cgroups have been configured in memory
+	podConfigTracker *podConfigTracker
 }
 
 // Make sure that podContainerManagerImpl implements the PodContainerManager interface
 var _ PodContainerManager = &podContainerManagerImpl{}
+
+func (m *podContainerManagerImpl) getPodConfigTracker() *podConfigTracker {
+	if m.podConfigTracker == nil {
+		m.podConfigTracker = newPodConfigTracker()
+	}
+	return m.podConfigTracker
+}
+
+// IsPodConfigured returns true if the pod's cgroup has been configured in memory
+func (m *podContainerManagerImpl) IsPodConfigured(pod *v1.Pod) bool {
+	return m.getPodConfigTracker().isConfigured(pod.UID)
+}
 
 // Exists checks if the pod's cgroup already exists
 func (m *podContainerManagerImpl) Exists(pod *v1.Pod) bool {
@@ -76,38 +131,46 @@ func (m *podContainerManagerImpl) Exists(pod *v1.Pod) bool {
 // EnsureExists takes a pod as argument and makes sure that
 // pod cgroup exists if qos cgroup hierarchy flag is enabled.
 // If the pod level container doesn't already exist it is created.
+// If it already exists on disk, but has not yet been configured in memory, it is updated.
 func (m *podContainerManagerImpl) EnsureExists(logger klog.Logger, pod *v1.Pod) error {
-	// check if container already exist
-	alreadyExists := m.Exists(pod)
-	if !alreadyExists {
-		enforceCPULimits := m.enforceCPULimits
-		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DisableCPUQuotaWithExclusiveCPUs) && m.podContainerManager.PodHasExclusiveCPUs(logger, pod) {
-			logger.V(2).Info("Disabled CFS quota", "pod", klog.KObj(pod))
-			enforceCPULimits = false
-		}
-		enforceMemoryQoS := false
-		if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.MemoryQoS) &&
-			libcontainercgroups.IsCgroup2UnifiedMode() {
-			enforceMemoryQoS = true
-		}
-		// Create the pod container
-		podContainerName, _ := m.GetPodContainerName(pod)
-		containerConfig := &CgroupConfig{
-			Name:               podContainerName,
-			ResourceParameters: ResourceConfigForPod(pod, enforceCPULimits, m.cpuCFSQuotaPeriod, enforceMemoryQoS, m.memoryReservationPolicy),
-		}
-		if m.podPidsLimit > 0 {
-			containerConfig.ResourceParameters.PidsLimit = &m.podPidsLimit
-		}
-		if enforceMemoryQoS {
-			m.applyPodLevelMemoryHigh(pod, containerConfig.ResourceParameters)
-			logger.V(4).Info("MemoryQoS config for pod", "pod", klog.KObj(pod), "unified", containerConfig.ResourceParameters.Unified)
-		}
+	if m.IsPodConfigured(pod) {
+		return nil
+	}
+
+	enforceCPULimits := m.enforceCPULimits
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.DisableCPUQuotaWithExclusiveCPUs) && m.podContainerManager != nil && m.podContainerManager.PodHasExclusiveCPUs(logger, pod) {
+		logger.V(2).Info("Disabled CFS quota", "pod", klog.KObj(pod))
+		enforceCPULimits = false
+	}
+	enforceMemoryQoS := false
+	if utilfeature.DefaultFeatureGate.Enabled(kubefeatures.MemoryQoS) &&
+		libcontainercgroups.IsCgroup2UnifiedMode() {
+		enforceMemoryQoS = true
+	}
+	// Create the pod container
+	podContainerName, _ := m.GetPodContainerName(pod)
+	containerConfig := &CgroupConfig{
+		Name:               podContainerName,
+		ResourceParameters: ResourceConfigForPod(pod, enforceCPULimits, m.cpuCFSQuotaPeriod, enforceMemoryQoS, m.memoryReservationPolicy),
+	}
+	if m.podPidsLimit > 0 {
+		containerConfig.ResourceParameters.PidsLimit = &m.podPidsLimit
+	}
+	if enforceMemoryQoS {
+		m.applyPodLevelMemoryHigh(pod, containerConfig.ResourceParameters)
+		logger.V(4).Info("MemoryQoS config for pod", "pod", klog.KObj(pod), "unified", containerConfig.ResourceParameters.Unified)
+	}
+	if !m.Exists(pod) {
 		if err := m.cgroupManager.Create(logger, containerConfig); err != nil {
 			return fmt.Errorf("failed to create container for %v : %v", podContainerName, err)
 		}
-
+	} else {
+		if err := m.cgroupManager.Update(logger, containerConfig); err != nil {
+			return fmt.Errorf("failed to update container for %v : %v", podContainerName, err)
+		}
 	}
+
+	m.getPodConfigTracker().markConfigured(pod.UID)
 	return nil
 }
 
@@ -233,6 +296,13 @@ func (m *podContainerManagerImpl) Destroy(logger klog.Logger, podCgroup CgroupNa
 		logger.Info("Failed to delete cgroup paths", "cgroupName", podCgroup, "err", err)
 		return fmt.Errorf("failed to delete cgroup paths for %v : %v", podCgroup, err)
 	}
+	if len(podCgroup) > 0 {
+		last := podCgroup[len(podCgroup)-1]
+		if strings.HasPrefix(last, podCgroupNamePrefix) {
+			podUID := types.UID(strings.TrimPrefix(last, podCgroupNamePrefix))
+			m.getPodConfigTracker().unmark(podUID)
+		}
+	}
 	return nil
 }
 
@@ -333,6 +403,10 @@ type podContainerManagerNoop struct {
 var _ PodContainerManager = &podContainerManagerNoop{}
 
 func (m *podContainerManagerNoop) Exists(_ *v1.Pod) bool {
+	return true
+}
+
+func (m *podContainerManagerNoop) IsPodConfigured(_ *v1.Pod) bool {
 	return true
 }
 

@@ -19,12 +19,14 @@ limitations under the License.
 package cm
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
 
 	v1 "k8s.io/api/core/v1"
@@ -294,4 +296,196 @@ func TestGetPodContainerName(t *testing.T) {
 			require.Equalf(t, tt.wantLiteralCgroupfs, actualLiteralCgroupfs, "Unexpected literal cgroupfs for pod with UID %s, container resources: %v", tt.args.pod.UID, tt.args.pod.Spec.Containers[0].Resources)
 		})
 	}
+}
+
+type fakePCMTestCgroupManager struct {
+	exists       map[string]bool
+	createErr    error
+	updateErr    error
+	destroyErr   error
+	createCalls  int
+	updateCalls  int
+	destroyCalls int
+}
+
+func (f *fakePCMTestCgroupManager) Create(_ klog.Logger, config *CgroupConfig) error {
+	f.createCalls++
+	if f.createErr != nil {
+		return f.createErr
+	}
+	if f.exists == nil {
+		f.exists = make(map[string]bool)
+	}
+	f.exists[config.Name.ToCgroupfs()] = true
+	return nil
+}
+
+func (f *fakePCMTestCgroupManager) Update(_ klog.Logger, _ *CgroupConfig) error {
+	f.updateCalls++
+	return f.updateErr
+}
+
+func (f *fakePCMTestCgroupManager) Destroy(_ klog.Logger, config *CgroupConfig) error {
+	f.destroyCalls++
+	if f.destroyErr != nil {
+		return f.destroyErr
+	}
+	if f.exists != nil {
+		delete(f.exists, config.Name.ToCgroupfs())
+	}
+	return nil
+}
+
+func (f *fakePCMTestCgroupManager) Validate(_ CgroupName) error { return nil }
+func (f *fakePCMTestCgroupManager) Exists(name CgroupName) bool {
+	if f.exists == nil {
+		return false
+	}
+	return f.exists[name.ToCgroupfs()]
+}
+func (f *fakePCMTestCgroupManager) Name(name CgroupName) string { return name.ToCgroupfs() }
+func (f *fakePCMTestCgroupManager) CgroupName(name string) CgroupName {
+	return ParseCgroupfsToCgroupName(name)
+}
+func (f *fakePCMTestCgroupManager) Pids(_ klog.Logger, _ CgroupName) []int { return nil }
+func (f *fakePCMTestCgroupManager) ReduceCPULimits(_ klog.Logger, _ CgroupName) error {
+	return nil
+}
+func (f *fakePCMTestCgroupManager) MemoryUsage(_ CgroupName) (int64, error) { return 0, nil }
+func (f *fakePCMTestCgroupManager) GetCgroupConfig(_ CgroupName, _ v1.ResourceName) (*ResourceConfig, error) {
+	return nil, nil
+}
+func (f *fakePCMTestCgroupManager) SetCgroupConfig(_ klog.Logger, _ CgroupName, _ *ResourceConfig) error {
+	return nil
+}
+func (f *fakePCMTestCgroupManager) Version() int { return 2 }
+
+func TestEnsureExistsIdempotencyAndReconciliation(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	qosContainersInfo := QOSContainersInfo{
+		Guaranteed: RootCgroupName,
+		Burstable:  NewCgroupName(RootCgroupName, strings.ToLower(string(v1.PodQOSBurstable))),
+		BestEffort: NewCgroupName(RootCgroupName, strings.ToLower(string(v1.PodQOSBestEffort))),
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: types.UID("test-pod-reconcile"),
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	t.Run("fresh pod creation succeeds and subsequent calls are no-op", func(t *testing.T) {
+		fakeCM := &fakePCMTestCgroupManager{}
+		pcm := &podContainerManagerImpl{
+			cgroupManager:     fakeCM,
+			qosContainersInfo: qosContainersInfo,
+		}
+
+		require.False(t, pcm.IsPodConfigured(pod))
+		require.False(t, pcm.Exists(pod))
+
+		// First call should Create
+		err := pcm.EnsureExists(logger, pod)
+		require.NoError(t, err)
+		require.Equal(t, 1, fakeCM.createCalls)
+		require.Equal(t, 0, fakeCM.updateCalls)
+		require.True(t, pcm.IsPodConfigured(pod))
+		require.True(t, pcm.Exists(pod))
+
+		// Second call should be a no-op because it's already configured
+		err = pcm.EnsureExists(logger, pod)
+		require.NoError(t, err)
+		require.Equal(t, 1, fakeCM.createCalls)
+		require.Equal(t, 0, fakeCM.updateCalls)
+	})
+
+	t.Run("Create failure does not mark pod configured and retry calls Update when cgroup exists", func(t *testing.T) {
+		fakeCM := &fakePCMTestCgroupManager{
+			createErr: fmt.Errorf("cgroup manager.Set failed: dbus timeout"),
+		}
+		pcm := &podContainerManagerImpl{
+			cgroupManager:     fakeCM,
+			qosContainersInfo: qosContainersInfo,
+		}
+
+		// First call: Create fails
+		err := pcm.EnsureExists(logger, pod)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "cgroup manager.Set failed")
+		require.Equal(t, 1, fakeCM.createCalls)
+		require.Equal(t, 0, fakeCM.updateCalls)
+		require.False(t, pcm.IsPodConfigured(pod))
+
+		// In reality, Apply(-1) created the directory before Set failed, so Exists is now true
+		fakeCM.createErr = nil
+		fakeCM.exists = map[string]bool{
+			NewCgroupName(qosContainersInfo.Burstable, "podtest-pod-reconcile").ToCgroupfs(): true,
+		}
+		require.True(t, pcm.Exists(pod))
+		require.False(t, pcm.IsPodConfigured(pod))
+
+		// Subsequent EnsureExists should call Update to reconcile
+		err = pcm.EnsureExists(logger, pod)
+		require.NoError(t, err)
+		require.Equal(t, 1, fakeCM.createCalls) // Not called again
+		require.Equal(t, 1, fakeCM.updateCalls) // Update was called to reconcile!
+		require.True(t, pcm.IsPodConfigured(pod))
+
+		// Further EnsureExists is a no-op
+		err = pcm.EnsureExists(logger, pod)
+		require.NoError(t, err)
+		require.Equal(t, 1, fakeCM.updateCalls)
+	})
+
+	t.Run("kubelet restart reconciles existing pod via Update", func(t *testing.T) {
+		fakeCM := &fakePCMTestCgroupManager{
+			exists: map[string]bool{
+				NewCgroupName(qosContainersInfo.Burstable, "podtest-pod-reconcile").ToCgroupfs(): true,
+			},
+		}
+		// On restart, a new PCM starts with empty in-memory tracker
+		pcm := &podContainerManagerImpl{
+			cgroupManager:     fakeCM,
+			qosContainersInfo: qosContainersInfo,
+			podConfigTracker:  newPodConfigTracker(),
+		}
+
+		require.True(t, pcm.Exists(pod))
+		require.False(t, pcm.IsPodConfigured(pod))
+
+		// EnsureExists on restart runs Update once to reconcile and rebuilds in-memory state
+		err := pcm.EnsureExists(logger, pod)
+		require.NoError(t, err)
+		require.Equal(t, 0, fakeCM.createCalls)
+		require.Equal(t, 1, fakeCM.updateCalls)
+		require.True(t, pcm.IsPodConfigured(pod))
+	})
+
+	t.Run("Destroy removes pod from in-memory tracker", func(t *testing.T) {
+		fakeCM := &fakePCMTestCgroupManager{}
+		pcm := &podContainerManagerImpl{
+			cgroupManager:     fakeCM,
+			qosContainersInfo: qosContainersInfo,
+		}
+
+		err := pcm.EnsureExists(logger, pod)
+		require.NoError(t, err)
+		require.True(t, pcm.IsPodConfigured(pod))
+
+		podCgroupName, _ := pcm.GetPodContainerName(pod)
+		err = pcm.Destroy(logger, podCgroupName)
+		require.NoError(t, err)
+		require.False(t, pcm.IsPodConfigured(pod))
+	})
 }

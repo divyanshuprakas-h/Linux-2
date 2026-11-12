@@ -2611,6 +2611,57 @@ func (_c *MockPodContainerManager_IsPodCgroup_Call) RunAndReturn(run func(cgroup
 	return _c
 }
 
+// IsPodConfigured provides a mock function for the type MockPodContainerManager
+func (_mock *MockPodContainerManager) IsPodConfigured(pod *v1.Pod) bool {
+	ret := _mock.Called(pod)
+
+	if len(ret) == 0 {
+		panic("no return value specified for IsPodConfigured")
+	}
+
+	var r0 bool
+	if returnFunc, ok := ret.Get(0).(func(*v1.Pod) bool); ok {
+		r0 = returnFunc(pod)
+	} else {
+		r0 = ret.Get(0).(bool)
+	}
+	return r0
+}
+
+// MockPodContainerManager_IsPodConfigured_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'IsPodConfigured'
+type MockPodContainerManager_IsPodConfigured_Call struct {
+	*mock.Call
+}
+
+// IsPodConfigured is a helper method to define mock.On call
+//   - pod *v1.Pod
+func (_e *MockPodContainerManager_Expecter) IsPodConfigured(pod any) *MockPodContainerManager_IsPodConfigured_Call {
+	return &MockPodContainerManager_IsPodConfigured_Call{Call: _e.mock.On("IsPodConfigured", pod)}
+}
+
+func (_c *MockPodContainerManager_IsPodConfigured_Call) Run(run func(pod *v1.Pod)) *MockPodContainerManager_IsPodConfigured_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 *v1.Pod
+		if args[0] != nil {
+			arg0 = args[0].(*v1.Pod)
+		}
+		run(
+			arg0,
+		)
+	})
+	return _c
+}
+
+func (_c *MockPodContainerManager_IsPodConfigured_Call) Return(b bool) *MockPodContainerManager_IsPodConfigured_Call {
+	_c.Call.Return(b)
+	return _c
+}
+
+func (_c *MockPodContainerManager_IsPodConfigured_Call) RunAndReturn(run func(pod *v1.Pod) bool) *MockPodContainerManager_IsPodConfigured_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // ReduceCPULimits provides a mock function for the type MockPodContainerManager
 func (_mock *MockPodContainerManager) ReduceCPULimits(logger klog.Logger, name cm.CgroupName) error {
 	ret := _mock.Called(logger, name)

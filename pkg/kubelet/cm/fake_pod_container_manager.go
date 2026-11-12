@@ -53,6 +53,13 @@ func (m *FakePodContainerManager) Exists(_ *v1.Pod) bool {
 	return true
 }
 
+func (m *FakePodContainerManager) IsPodConfigured(_ *v1.Pod) bool {
+	m.Lock()
+	defer m.Unlock()
+	m.CalledFunctions = append(m.CalledFunctions, "IsPodConfigured")
+	return true
+}
+
 func (m *FakePodContainerManager) EnsureExists(_ klog.Logger, _ *v1.Pod) error {
 	m.Lock()
 	defer m.Unlock()
